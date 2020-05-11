@@ -22,6 +22,7 @@ To emulate botnet attack from many ips, attcker's _eth0_ aliased with ips from
  172.26.0.0/16 subnet (BLOCK I on pic. 1). Static route to 172.26.0.0/16 to attackers PC on router
   (BLOCK II on pic. 1). Router is in between attacker and web server (BLOCK III on pic. 1)
 ![scheme pic. 1](doc/test_lab_scheme.png)
+
 _Pic. 1 test lab scheme_
 
 # Usage
