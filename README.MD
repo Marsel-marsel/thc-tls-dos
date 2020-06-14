@@ -3,10 +3,10 @@ Web server TLS handshake benchmarking tool
 
 # Why it forked
 After some research I found [thc-tls-dos](https://github.com/azet/thc-tls-dos) - tool
-that exploits the fact that server renegotiate encryption key when client ask to do so.
-Actually, web server vendors, like nginx, [disabled](http://nginx.org/en/CHANGES-1.18) this feature in
+that exploits the fact that server renegotiate encryption key when client asks to do so.
+Actually, web server software vendors like nginx [disabled](http://nginx.org/en/CHANGES-1.18) this feature in
 version 0.8.23 back in 11 Nov 2009, so this attack vector
-is not used anymore. Anyway, original project traffic flow looks like this:
+is not used anymore. But this tool have a good basis to upgrade it to TLS webserver benchmarking tool. Original traffic flow looks like this:
 1. Establish TCP connection
 2. Open SSL session
 3. ChangeCipherSpec <- at this point modern web server sends SSL alert and closes TCP connection
